@@ -9,7 +9,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-BOT_TOKEN = os.environ.get("7299506136:AAH1X9eyeBCP5OkC91tEVpGB0GEGpU6-i3k")
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 CAMERA_PROCESS = None
 AI_ENABLED = True
