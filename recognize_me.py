@@ -19,7 +19,7 @@ def train_model():
     images, labels = [], []
 
     for fn in os.listdir(DATA_DIR):
-        if fn.lower().endswith(".png"):
+        if fn.lower().endswith((".png", ".jpg", ".jpeg")):
             img = cv2.imread(os.path.join(DATA_DIR, fn), cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 images.append(img)
