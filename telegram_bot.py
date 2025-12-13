@@ -1,254 +1,254 @@
-#!/usr/bin/env python3
 import os
+import sys
 import time
 import asyncio
+import signal
 import subprocess
-from pathlib import Path
+from datetime import datetime
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
+from telegram.error import TimedOut, NetworkError
+from telegram.request import HTTPXRequest
 
-# --- CONFIG ---
-REPO_DIR = Path(__file__).resolve().parent
-RECOGNIZE_SCRIPT = REPO_DIR / "recognize_me.py"
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-
-# AI (optional)
+# --- AI (OpenAI) ---
 try:
-    from ai_chat import ask_ai  # expects OPENAI_API_KEY in env
+    from ai_chat import ask_ai
     AI_AVAILABLE = True
 except Exception:
     ask_ai = None
     AI_AVAILABLE = False
 
+# ======================
+# CONFIG
+# ======================
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 
-# --- RUNTIME STATE (in-memory) ---
+# Камера/процеси
+REPO_DIR = os.path.abspath(os.path.dirname(__file__))
+RECOGNIZE_SCRIPT = os.path.join(REPO_DIR, "recognize_me.py")
+
+# Фото (найнадійніше через libcamera-still)
+PHOTO_PATH = "/tmp/ai_cam_photo.jpg"
+
+# Глобальний стан
 STATE = {
     "camera_on": False,
     "ai_on": True,
-    "proc": None,          # subprocess.Popen for recognize_me.py
-    "last_start_ts": 0.0,
+    "cam_proc": None,  # subprocess.Popen
+    "last_ai_ts": 0.0,
 }
 
-
-def keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+# Клавіатура
+def main_keyboard():
+    return ReplyKeyboardMarkup(
         [
-            InlineKeyboardButton("▶ Камера ON", callback_data="cam_on"),
-            InlineKeyboardButton("⏸ Камера OFF", callback_data="cam_off"),
+            ["▶️ Камера ON", "⏸️ Камера OFF"],
+            ["📸 Фото"],
+            ["🧠 AI ON/OFF"],
+            ["📊 Статус"],
         ],
-        [
-            InlineKeyboardButton("📸 Фото", callback_data="photo"),
-        ],
-        [
-            InlineKeyboardButton("🧠 AI ON/OFF", callback_data="ai_toggle"),
-        ],
-        [
-            InlineKeyboardButton("📊 Статус", callback_data="status"),
-        ],
-    ])
-
-
-async def safe_send(update: Update, text: str, reply_markup=None):
-    if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup)
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
-
-
-def start_camera_process() -> str:
-    # already running?
-    if STATE["proc"] and STATE["proc"].poll() is None:
-        STATE["camera_on"] = True
-        return "Камера вже працює ✅"
-
-    if not RECOGNIZE_SCRIPT.exists():
-        return f"Не знайдено {RECOGNIZE_SCRIPT.name} ❌ (перевір репо)"
-
-    # start recognize_me.py
-    proc = subprocess.Popen(
-        ["python3", str(RECOGNIZE_SCRIPT)],
-        cwd=str(REPO_DIR),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,  # detach from bot process
+        resize_keyboard=True
     )
-    STATE["proc"] = proc
-    STATE["camera_on"] = True
-    STATE["last_start_ts"] = time.time()
-    return "Камера запущена ✅"
 
-
-def stop_camera_process() -> str:
-    proc = STATE.get("proc")
-    if proc and proc.poll() is None:
+# ======================
+# SAFE SEND (важливо!)
+# ======================
+async def safe_send(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, kb=True):
+    """
+    Надійна відправка повідомлення: retries + не валить бота при TimedOut.
+    """
+    markup = main_keyboard() if kb else None
+    for attempt in range(3):
         try:
-            proc.terminate()
-        except Exception:
-            pass
+            if update.message:
+                await update.message.reply_text(text, reply_markup=markup)
+            elif update.callback_query:
+                await update.callback_query.message.reply_text(text, reply_markup=markup)
+            return
+        except (TimedOut, NetworkError) as e:
+            # Telegram іноді "підвисає" — пробуємо ще раз
+            await asyncio.sleep(1.2 * (attempt + 1))
+            if attempt == 2:
+                # остання спроба — просто не падаємо
+                print(f"[safe_send] failed after retries: {e}")
+                return
+        except Exception as e:
+            print(f"[safe_send] unexpected error: {e}")
+            return
 
-    STATE["proc"] = None
-    STATE["camera_on"] = False
-    return "Камера зупинена ✅"
+# ======================
+# CAMERA CONTROL
+# ======================
+def _is_proc_alive(p: subprocess.Popen | None) -> bool:
+    return p is not None and (p.poll() is None)
 
+def start_camera_process():
+    if _is_proc_alive(STATE["cam_proc"]):
+        return True, "Камера вже запущена ✅"
 
-def build_status() -> str:
-    proc = STATE.get("proc")
-    running = (proc is not None and proc.poll() is None)
-    cam = "ON" if running else "OFF"
-    ai = "ON" if STATE["ai_on"] else "OFF"
-    ai_av = "OK" if AI_AVAILABLE else "NO ai_chat.py"
-    key = "OK" if OPENAI_API_KEY else "NO KEY"
-    return (
-        f"📊 Статус:\n"
-        f"Камера: {cam}\n"
-        f"AI: {ai}\n"
-        f"AI модуль: {ai_av}\n"
-        f"OPENAI_API_KEY: {key}\n\n"
-        f"💬 Можеш просто написати текстом задачу/план — я відповім."
-    )
+    if not os.path.exists(RECOGNIZE_SCRIPT):
+        return False, f"Не знайдено файл {RECOGNIZE_SCRIPT}"
 
+    # Запускаємо тим самим python, що і бот (venv)
+    py = sys.executable
+    try:
+        p = subprocess.Popen(
+            [py, RECOGNIZE_SCRIPT],
+            cwd=REPO_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid  # щоб убивати групу процесів
+        )
+        STATE["cam_proc"] = p
+        STATE["camera_on"] = True
+        return True, "🎥 Камера запущена ✅"
+    except Exception as e:
+        return False, f"Помилка запуску камери: {e}"
 
+def stop_camera_process():
+    p = STATE["cam_proc"]
+    if not _is_proc_alive(p):
+        STATE["cam_proc"] = None
+        STATE["camera_on"] = False
+        return True, "Камера вже зупинена ✅"
+
+    try:
+        # Вбиваємо всю групу процесів
+        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        time.sleep(0.7)
+        if _is_proc_alive(p):
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        STATE["cam_proc"] = None
+        STATE["camera_on"] = False
+        return True, "⏸️ Камера зупинена ✅"
+    except Exception as e:
+        return False, f"Не зміг зупинити камеру: {e}"
+
+def take_photo_libcamera() -> tuple[bool, str]:
+    """
+    Робимо фото через libcamera-still (не потрібно окремих python-модулів).
+    """
+    try:
+        # -n: no preview, --timeout 1000: 1 сек
+        cmd = ["libcamera-still", "-n", "--timeout", "1000", "-o", PHOTO_PATH]
+        r = subprocess.run(cmd, cwd=REPO_DIR, capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return False, f"Помилка фото (libcamera): {r.stderr[-400:]}"
+        if not os.path.exists(PHOTO_PATH):
+            return False, "Фото не створилось (файлу немає)."
+        return True, PHOTO_PATH
+    except FileNotFoundError:
+        return False, "Команда libcamera-still не знайдена. Встанови: sudo apt install -y libcamera-apps"
+    except Exception as e:
+        return False, f"Помилка фото: {e}"
+
+# ======================
+# HANDLERS
+# ======================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send(update, "✅ Бот онлайн.\nНапиши задачу текстом або користуйся кнопками нижче.", reply_markup=keyboard())
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send(
-        update,
-        "Команди:\n"
-        "/start — меню\n"
-        "/status — статус\n"
-        "/ai_on — AI ON\n"
-        "/ai_off — AI OFF\n\n"
-        "Або просто напиши повідомлення — це буде як 'завдання/план'.",
-        reply_markup=keyboard()
-    )
-
+    text = "✅ Бот онлайн.\nНапиши задачу текстом або користуйся кнопками нижче."
+    await safe_send(update, context, text, kb=True)
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send(update, build_status(), reply_markup=keyboard())
-
-
-async def cmd_ai_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STATE["ai_on"] = True
-    await safe_send(update, "AI увімкнено ✅", reply_markup=keyboard())
-
-
-async def cmd_ai_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STATE["ai_on"] = False
-    await safe_send(update, "AI вимкнено ✅", reply_markup=keyboard())
-
-
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-
-    if data == "cam_on":
-        msg = start_camera_process()
-        await safe_send(update, msg, reply_markup=keyboard())
-        return
-
-    if data == "cam_off":
-        msg = stop_camera_process()
-        await safe_send(update, msg, reply_markup=keyboard())
-        return
-
-    if data == "ai_toggle":
-        STATE["ai_on"] = not STATE["ai_on"]
-        await safe_send(update, f"AI: {'ON ✅' if STATE['ai_on'] else 'OFF ⛔'}", reply_markup=keyboard())
-        return
-
-    if data == "status":
-        await safe_send(update, build_status(), reply_markup=keyboard())
-        return
-
-    if data == "photo":
-        # quick snapshot using libcamera-still (works even if camera script is off, but camera must be available)
-        tmp = REPO_DIR / "tg_photo.jpg"
-        try:
-            # timeout to avoid hanging
-            subprocess.run(
-                ["libcamera-still", "-n", "-o", str(tmp), "--width", "1280", "--height", "720", "--timeout", "300"],
-                cwd=str(REPO_DIR),
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            await query.message.reply_photo(photo=open(tmp, "rb"), caption="📸 Фото")
-        except Exception as e:
-            await safe_send(update, f"Не вийшло зробити фото ❌\n{e}", reply_markup=keyboard())
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
-        return
-
+    cam = "ON ✅" if STATE["camera_on"] else "OFF ⛔"
+    ai = "ON ✅" if STATE["ai_on"] else "OFF ⛔"
+    alive = "так" if _is_proc_alive(STATE["cam_proc"]) else "ні"
+    msg = f"📊 Статус:\nКамера: {cam}\nAI: {ai}\nПроцес камери живий: {alive}"
+    await safe_send(update, context, msg, kb=True)
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if not text:
+    t = (update.message.text or "").strip()
+
+    # Кнопки (текстові)
+    if t in ("▶️ Камера ON", "Camera ON", "Камера ON"):
+        ok, msg = start_camera_process()
+        await safe_send(update, context, msg, kb=True)
         return
 
-    # Treat any text as "task / plan"
-    if not STATE["ai_on"] or (not AI_AVAILABLE) or (ask_ai is None):
-        await update.message.reply_text(
-            "📝 Прийняв задачу.\n"
-            f"Текст: {text}\n\n"
-            "AI зараз OFF або недоступний. Увімкни AI кнопкою або /ai_on.",
-            reply_markup=keyboard()
-        )
+    if t in ("⏸️ Камера OFF", "Camera OFF", "Камера OFF"):
+        ok, msg = stop_camera_process()
+        await safe_send(update, context, msg, kb=True)
         return
 
-    # Ask AI
+    if t in ("📸 Фото", "Фото"):
+        ok, res = take_photo_libcamera()
+        if not ok:
+            await safe_send(update, context, f"❌ {res}", kb=True)
+            return
+        try:
+            await update.message.reply_photo(photo=open(res, "rb"), caption="📸 Ось фото", reply_markup=main_keyboard())
+        except (TimedOut, NetworkError) as e:
+            await safe_send(update, context, f"❌ Telegram timeout при відправці фото: {e}", kb=True)
+        except Exception as e:
+            await safe_send(update, context, f"❌ Не зміг відправити фото: {e}", kb=True)
+        return
+
+    if t in ("🧠 AI ON/OFF", "AI ON/OFF"):
+        STATE["ai_on"] = not STATE["ai_on"]
+        await safe_send(update, context, f"AI: {'ON ✅' if STATE['ai_on'] else 'OFF ⛔'}", kb=True)
+        return
+
+    if t in ("📊 Статус", "Статус"):
+        await cmd_status(update, context)
+        return
+
+    # Звичайний текст = "завдання"
+    if not STATE["ai_on"]:
+        await safe_send(update, context, "AI зараз вимкнений. Увімкни через 🧠 AI ON/OFF.", kb=True)
+        return
+
+    if not AI_AVAILABLE or not ask_ai:
+        await safe_send(update, context, "AI модуль недоступний (ai_chat.py не підключився).", kb=True)
+        return
+
+    # щоб не спамив API
+    now = time.time()
+    if now - STATE["last_ai_ts"] < 2.0:
+        await asyncio.sleep(0.2)
+
     try:
-        prompt = (
-            "Ти короткий асистент. Користувач написав завдання/план. "
-            "Відповідай українською коротко, по суті: 1) уточнювальне питання, 2) 2-3 кроки.\n\n"
-            f"Текст користувача: {text}"
-        )
-        # run in thread to avoid blocking asyncio loop
-        resp = await asyncio.to_thread(ask_ai, prompt)
-        resp = (resp or "").strip() or "Ок. Уточни, будь ласка, що саме потрібно зробити?"
-        await update.message.reply_text(resp, reply_markup=keyboard())
+        answer = ask_ai(t)
+        if not answer:
+            answer = "Не отримав відповідь від AI."
+        STATE["last_ai_ts"] = time.time()
+        await safe_send(update, context, answer, kb=True)
     except Exception as e:
-        await update.message.reply_text(f"AI помилка ❌\n{e}", reply_markup=keyboard())
+        # тут можуть бути quota/429 і т.д.
+        await safe_send(update, context, f"AI помилка ❌\n{str(e)[:250]}", kb=True)
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # Головне: не вбиваємо бота при будь-якій помилці
+    print(f"[ERROR] {context.error}")
 
 def main():
-    if not TELEGRAM_BOT_TOKEN:
+    if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # ВАЖЛИВО: збільшуємо таймаути до Telegram (щоб не було TimedOut)
+    request = HTTPXRequest(
+        connect_timeout=20.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("ai_on", cmd_ai_on))
-    app.add_handler(CommandHandler("ai_off", cmd_ai_off))
 
-    app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
 
+    print("✅ Telegram bot started")
     app.run_polling(close_loop=False)
-
 
 if __name__ == "__main__":
     main()
