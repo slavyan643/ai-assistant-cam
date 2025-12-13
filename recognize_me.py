@@ -7,11 +7,13 @@ DATA_DIR = "faces_data"
 MODEL_FILE = "me_model.yml"
 LABEL_ME = 1
 
-# --- Налаштування ---
+# --- Налаштування розпізнавання ---
 LBPH_THRESHOLD = 70
 FRAME_SLEEP = 0.25
 ME_STREAK_ON = 5
 ME_STREAK_OFF = 5
+
+# --- Повідомлення в консолі ---
 TEXT_COOLDOWN_SEC = 30
 
 # --- AI (ініціативний) ---
@@ -26,6 +28,7 @@ except Exception:
     AI_AVAILABLE = False
     ask_ai = None
 
+
 def train_model():
     if not os.path.isdir(DATA_DIR):
         raise RuntimeError("No faces_data folder. Run enroll_me.py first.")
@@ -35,7 +38,8 @@ def train_model():
 
     for fn in sorted(os.listdir(DATA_DIR)):
         if fn.lower().endswith(".png"):
-            img = cv2.imread(os.path.join(DATA_DIR, fn), cv2.IMREAD_GRAYSCALE)
+            path = os.path.join(DATA_DIR, fn)
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 images.append(img)
                 labels.append(LABEL_ME)
@@ -47,9 +51,11 @@ def train_model():
     recognizer.train(images, labels)
     recognizer.save(MODEL_FILE)
 
+
 def safe_ai_prompt() -> str:
-    # запасний варіант без API
+    # Запасний варіант без API
     return "Привіт! Я бачу тебе. Що хочеш зробити зараз? Які плани?"
+
 
 def get_proactive_ai_message() -> str:
     """
@@ -69,6 +75,7 @@ def get_proactive_ai_message() -> str:
         return msg if msg else safe_ai_prompt()
     except Exception:
         return safe_ai_prompt()
+
 
 def main():
     if not os.path.exists(MODEL_FILE):
@@ -92,11 +99,11 @@ def main():
     confirmed_me = False
     me_streak = 0
     not_me_streak = 0
-    last_text_ts = 0.0
 
+    last_text_ts = 0.0
     last_ai_ts = 0.0
 
-    print("AI camera started (TEXT MODE)")
+    print("AI camera started (TEXT+AI)")
     if AI_ENABLED:
         print(f"AI: {'ON' if AI_AVAILABLE else 'OFF (ai_chat not found or error)'}")
 
@@ -107,6 +114,7 @@ def main():
             time.sleep(0.05)
             continue
 
+        # Picamera2 (XRGB8888) -> беремо тільки RGB
         frame_rgb = frame[:, :, :3]
         gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
 
@@ -123,6 +131,7 @@ def main():
             if label == LABEL_ME and confidence < LBPH_THRESHOLD:
                 is_me_raw = True
 
+        # Стабілізація: streak
         if is_me_raw:
             me_streak += 1
             not_me_streak = 0
@@ -170,6 +179,7 @@ def main():
         time.sleep(FRAME_SLEEP)
 
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
