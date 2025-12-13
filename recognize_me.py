@@ -2,26 +2,39 @@ from picamera2 import Picamera2
 import cv2
 import time
 import os
-import numpy as np
 
-# ====== PATHS ======
+# ===== Telegram =====
+from telegram_notify import send_telegram
+
+# ===== DATA =====
 DATA_DIR = "faces_data"
 MODEL_FILE = "me_model.yml"
-CASCADE_PATH = "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
-
 LABEL_ME = 1
 
-# ====== SETTINGS ======
-LBPH_THRESHOLD = 70
+# ===== SETTINGS =====
+LBPH_THRESHOLD = 75
 FRAME_SLEEP = 0.25
 ME_STREAK_ON = 5
 ME_STREAK_OFF = 5
-TEXT_COOLDOWN_SEC = 30
 
-# ====== TRAIN MODEL ======
+TEXT_COOLDOWN_SEC = 30
+AI_COOLDOWN_SEC = 180   # AI пише раз на 3 хв
+
+# ===== AI =====
+AI_ENABLED = True
+try:
+    from ai_chat import ask_ai
+    AI_AVAILABLE = True
+except Exception as e:
+    print("AI disabled:", e)
+    AI_AVAILABLE = False
+    ask_ai = None
+
+
+# ===== TRAIN =====
 def train_model():
     if not os.path.isdir(DATA_DIR):
-        raise RuntimeError("faces_data folder not found")
+        raise RuntimeError("faces_data not found")
 
     images = []
     labels = []
@@ -39,15 +52,33 @@ def train_model():
     if len(images) < 10:
         raise RuntimeError("Need more samples")
 
-    labels = np.array(labels, dtype=np.int32)
-
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     recognizer.train(images, labels)
     recognizer.save(MODEL_FILE)
 
-    print(f"✓ Model trained & saved: {MODEL_FILE} (samples={len(images)})")
+    print(f"✔ Model trained & saved: {MODEL_FILE} (samples={len(images)})")
 
-# ====== MAIN ======
+
+# ===== AI TEXT =====
+def get_ai_message():
+    if not (AI_ENABLED and AI_AVAILABLE and ask_ai):
+        return "Привіт! Я бачу тебе. Які плани?"
+
+    try:
+        prompt = (
+            "Ти домашній AI асистент з камерою. "
+            "Користувача щойно впізнано. "
+            "Задай ОДНЕ коротке питання українською: "
+            "що він хоче зробити або які плани."
+        )
+        msg = ask_ai(prompt)
+        return msg.strip() if msg else "Привіт! Я бачу тебе. Які плани?"
+    except Exception as e:
+        print("AI error:", e)
+        return "Привіт! Я бачу тебе. Які плани?"
+
+
+# ===== MAIN =====
 def main():
     if not os.path.exists(MODEL_FILE):
         print("No model file, training now...")
@@ -56,9 +87,9 @@ def main():
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     recognizer.read(MODEL_FILE)
 
-    face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-    if face_cascade.empty():
-        raise RuntimeError(f"Cannot load cascade: {CASCADE_PATH}")
+    face_cascade = cv2.CascadeClassifier(
+        "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
+    )
 
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
@@ -71,27 +102,25 @@ def main():
     confirmed_me = False
     me_streak = 0
     not_me_streak = 0
-    last_text_ts = 0.0
 
-    print("AI camera started (TEXT MODE)")
+    last_text_ts = 0.0
+    last_ai_ts = 0.0
+
+    print("🎥 AI Assistant Cam started")
 
     while True:
         frame = picam2.capture_array()
         frame_rgb = frame[:, :, :3]
         gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
 
-        faces = face_cascade.detectMultiScale(
-            gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)
-        )
+        faces = face_cascade.detectMultiScale(gray, 1.2, 5, minSize=(80, 80))
 
         is_me_raw = False
         conf = None
 
         if len(faces) > 0:
             x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-            roi = gray[y:y+h, x:x+w]
-            roi = cv2.resize(roi, (200, 200))
-
+            roi = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
             label, confidence = recognizer.predict(roi)
             conf = confidence
             if label == LABEL_ME and confidence < LBPH_THRESHOLD:
@@ -111,10 +140,21 @@ def main():
             confirmed_me = False
 
         now = time.time()
-        if confirmed_me and not prev and now - last_text_ts > TEXT_COOLDOWN_SEC:
-            print("👤 ТЕБЕ ВПІЗНАНО | YOU ARE RECOGNIZED")
-            last_text_ts = now
 
+        # ===== EVENT: RECOGNIZED =====
+        if confirmed_me and not prev:
+            if now - last_text_ts > TEXT_COOLDOWN_SEC:
+                print("👤 YOU ARE RECOGNIZED")
+                send_telegram("👤 ТЕБЕ ВПІЗНАНО")
+                last_text_ts = now
+
+            if AI_ENABLED and (now - last_ai_ts) > AI_COOLDOWN_SEC:
+                msg = get_ai_message()
+                print("AI:", msg)
+                send_telegram("🤖 " + msg)
+                last_ai_ts = now
+
+        # ===== OVERLAY =====
         if confirmed_me:
             cv2.putText(frame_rgb, "YOU", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
@@ -133,6 +173,7 @@ def main():
         time.sleep(FRAME_SLEEP)
 
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
